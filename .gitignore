@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Claude
+.claude/
+
+# Testing
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# ViZDoom generated
+_vizdoom.ini
+
+# MCP local config (contains absolute paths)
+.mcp.json
