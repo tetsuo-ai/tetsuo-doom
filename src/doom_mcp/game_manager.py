@@ -1,11 +1,15 @@
 """Core game manager wrapping ViZDoom's DoomGame."""
 
+import math
 import os
+import threading
 
 import vizdoom as vzd
 from fastmcp.exceptions import ToolError
 
 from .actions import BUTTON_NAMES, names_to_action_list
+from .navigation import NavigationMemory
+from .objects import get_object_info
 from .scenarios import get_scenario_config_path
 from .state import (
     extract_depth_as_stats,
@@ -14,6 +18,58 @@ from .state import (
     extract_sectors,
     screen_buffer_to_png,
 )
+
+_ACTIONABLE_TYPES = {"monster", "player", "hazard", "projectile", "key", "weapon"}
+_ITEM_TYPES = {"item", "ammo"}
+_NEARBY_RANGE = 1500.0  # units - items/ammo within this range are included
+_MONSTER_RANGE = 4000.0  # units - monsters within this range are included
+
+# Compound action constants
+_WALL_CLOSE = 15.0        # depth buffer units (0-255 scale) - imminent collision
+_WALL_NEAR = 40.0         # depth buffer units - start turning
+_STUCK_WINDOW = 20        # tics to check for stuck
+_STUCK_THRESHOLD = 15.0   # map units - min spread to not be stuck
+_ARRIVE_DISTANCE = 64.0   # map units - close enough for move_to
+_ENEMY_ALERT_DIST = 800.0 # map units - enemy proximity alert
+_AIM_TOLERANCE = 3.0      # degrees - close enough to fire
+
+
+def _filter_objects(objects: list[dict]) -> list[dict]:
+    """Filter objects to only actionable ones and slim down fields."""
+    filtered = []
+    for obj in objects:
+        obj_type = obj.get("type", "")
+        dist = obj.get("distance", 9999)
+        visible = obj.get("is_visible", False)
+
+        include = False
+        if visible:
+            include = True
+        elif obj_type in _ACTIONABLE_TYPES and dist <= _MONSTER_RANGE:
+            include = True
+        elif obj_type in _ITEM_TYPES and dist <= _NEARBY_RANGE:
+            include = True
+
+        if include:
+            slim = {
+                "id": obj["id"],
+                "name": obj["name"],
+                "distance": obj["distance"],
+                "angle_to_aim": obj["angle_to_aim"],
+                "type": obj["type"],
+                "threat": obj["threat"],
+                "is_visible": visible,
+            }
+            # Only add fields when they carry useful info
+            if obj["threat"] != "none":
+                slim["attack_type"] = obj["attack_type"]
+                slim["typical_hp"] = obj["typical_hp"]
+            if visible and "screen_x" in obj:
+                slim["screen_x"] = obj["screen_x"]
+                slim["screen_y"] = obj["screen_y"]
+            filtered.append(slim)
+    return filtered
+
 
 # Delta buttons for precise aiming + binary buttons for movement/actions.
 # TURN_LEFT_RIGHT_DELTA: positive = turn right (degrees, multiplied by tics)
@@ -117,6 +173,10 @@ class GameManager:
         self._scenario_name: str = ""
         self._wad: str | None = None
         self._current_map: str | None = None
+        self._async: bool = False
+        self._recording_path: str | None = None
+        self._nav_memory = NavigationMemory()
+        self._game_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -161,26 +221,39 @@ class GameManager:
         pa = game.get_game_variable(vzd.GameVariable.ANGLE)
         return px, py, pa
 
-    def _extract_full_state(self, game: vzd.DoomGame) -> dict:
-        """Extract complete game state: variables, objects, sectors, depth."""
+    def _extract_full_state(
+        self,
+        game: vzd.DoomGame,
+        include_sectors: bool = False,
+        include_depth: bool = True,
+    ) -> dict:
+        """Extract complete game state: variables, objects, and optionally sectors/depth."""
         state = game.get_state()
         variables = extract_game_variables(game, self._variable_names)
         px, py, pa = self._get_player_pos(game)
-        objects = extract_objects(state, player_x=px, player_y=py, player_angle=pa)
-        sectors = extract_sectors(state)
-        depth = extract_depth_as_stats(state.depth_buffer) if state.depth_buffer is not None else None
+        all_objects = extract_objects(state, player_x=px, player_y=py, player_angle=pa)
+        # Filter to actionable objects to keep response size manageable
+        objects = _filter_objects(all_objects)
         screenshot_png = screen_buffer_to_png(state.screen_buffer)
 
-        return {
+        # Update navigation memory with full object list
+        self._nav_memory.update(px, py, pa, objects=all_objects)
+
+        result = {
             "episode_finished": False,
             "tic": state.tic,
             "game_variables": variables,
             "objects": objects,
-            "sectors": sectors,
-            "depth": depth,
             "total_reward": game.get_total_reward(),
             "screenshot_png": screenshot_png,
         }
+
+        if include_sectors:
+            result["sectors"] = extract_sectors(state)
+        if include_depth and state.depth_buffer is not None:
+            result["depth"] = extract_depth_as_stats(state.depth_buffer)
+
+        return result
 
     def _finished_state(self, game: vzd.DoomGame, reward: float | None = None) -> dict:
         """Return state dict for a finished episode."""
@@ -216,7 +289,10 @@ class GameManager:
         episode_timeout: int | None = None,
         render_hud: bool = False,
         window_visible: bool = False,
+        async_player: bool = False,
+        ticrate: int | None = None,
         seed: int | None = None,
+        recording_path: str | None = None,
     ) -> dict:
         """Start a new game with the given configuration.
 
@@ -224,9 +300,17 @@ class GameManager:
         for full Doom campaign maps. If wad is provided, scenario is ignored.
 
         Available WADs bundled with ViZDoom:
-            "freedoom1" — Freedoom Phase 1 (Doom 1 format, maps E1M1-E4M9)
-            "freedoom2" — Freedoom Phase 2 (Doom 2 format, maps MAP01-MAP32)
+            "freedoom1" - Freedoom Phase 1 (Doom 1 format, maps E1M1-E4M9)
+            "freedoom2" - Freedoom Phase 2 (Doom 2 format, maps MAP01-MAP32)
             Or provide an absolute path to any .wad file.
+
+        Args:
+            async_player: Use ASYNC_PLAYER mode so the game runs in real-time
+                in a separate thread. The window shows smooth continuous gameplay
+                instead of freezing between agent actions. Between take_action
+                calls the player stands idle but the world keeps running.
+            ticrate: Game speed in tics/sec for async mode (default 35 = normal
+                Doom speed). Only affects ASYNC_PLAYER mode.
         """
         if self._game is not None:
             self.stop()
@@ -284,7 +368,12 @@ class GameManager:
         game.set_automap_rotate(False)
         game.set_episode_start_time(14)
         game.set_window_visible(window_visible)
-        game.set_mode(vzd.Mode.PLAYER)
+        if async_player:
+            game.set_mode(vzd.Mode.ASYNC_PLAYER)
+            if ticrate is not None:
+                game.set_ticrate(ticrate)
+        else:
+            game.set_mode(vzd.Mode.PLAYER)
         game.set_doom_skill(difficulty)
         game.set_render_hud(render_hud)
 
@@ -311,13 +400,15 @@ class GameManager:
             game.add_available_game_variable(var)
             resolved_variable_names.append(upper)
 
-        game.init()
-
         # Set map exit reward so completing a level gives positive feedback
         if wad is not None:
             game.set_map_exit_reward(100.0)
 
         game.init()
+
+        self._recording_path = recording_path
+        if recording_path:
+            game.new_episode(recording_path)
 
         self._game = game
         self._buttons = resolved_buttons
@@ -325,6 +416,8 @@ class GameManager:
         self._scenario_name = scenario if wad is None else f"{wad}:{map_name or 'default'}"
         self._wad = wad
         self._current_map = map_name
+        self._async = async_player
+        self._nav_memory.reset()
 
         result = {
             "status": "running",
@@ -349,9 +442,11 @@ class GameManager:
             self._scenario_name = ""
             self._wad = None
             self._current_map = None
+            self._async = False
+            self._recording_path = None
         return {"status": "stopped"}
 
-    def new_episode(self) -> dict:
+    def new_episode(self, recording_path: str | None = None) -> dict:
         """Start a new episode. In campaign mode, auto-advances on level completion.
 
         If the player completed the level (not dead), advances to the next map.
@@ -368,7 +463,14 @@ class GameManager:
                 self._current_map = nxt
                 advanced = True
 
-        game.new_episode()
+        rec = recording_path or self._recording_path
+        if rec:
+            game.new_episode(rec)
+            self._recording_path = rec
+        else:
+            game.new_episode()
+
+        self._nav_memory.reset()
 
         result = {"status": "new_episode"}
         if self._current_map:
@@ -379,19 +481,61 @@ class GameManager:
             result["scenario"] = self._scenario_name
         return result
 
-    def get_state(self) -> dict:
-        """Get complete game state: variables, objects, sectors, depth, screenshot."""
+    def get_state(
+        self,
+        include_sectors: bool = False,
+        include_depth: bool = True,
+    ) -> dict:
+        """Get complete game state: variables, objects, screenshot, and optionally sectors/depth."""
         game = self._require_running()
 
-        if game.is_episode_finished():
-            return self._finished_state(game)
+        with self._game_lock:
+            if game.is_episode_finished():
+                return self._finished_state(game)
 
-        return self._extract_full_state(game)
+            return self._extract_full_state(game, include_sectors=include_sectors, include_depth=include_depth)
+
+    def _build_action_list(self, actions: dict[str, float] | None = None) -> list[float]:
+        """Convert an action dict to a ViZDoom action list. Skips unknown buttons silently."""
+        action_list = [0.0] * len(self._buttons)
+        if not actions:
+            return action_list
+        button_index = {b.name: i for i, b in enumerate(self._buttons)}
+        for name, value in actions.items():
+            upper = name.upper()
+            if upper not in button_index:
+                continue
+            action_list[button_index[upper]] = float(value)
+        return action_list
+
+    def _make_action(self, game: vzd.DoomGame, action: list[float], tics: int = 1) -> float:
+        """make_action wrapper for compound action loops.
+
+        In ASYNC_PLAYER mode, make_action applies the PREVIOUS call's action
+        to the current tic, not the action we're setting now. This causes a
+        1-tic delay that makes feedback loops (like aiming) oscillate.
+
+        Fix: after setting our action, do one extra noop tic to flush it,
+        so the game state reflects our action before we read it again.
+        """
+        if self._async:
+            game.make_action(action, 1)        # queue our action, apply prev
+            for _ in range(tics - 1):
+                if game.is_episode_finished():
+                    break
+                game.make_action(action, 1)    # keep applying for multi-tic
+            if not game.is_episode_finished():
+                noop = [0.0] * len(self._buttons)
+                game.make_action(noop, 1)      # flush: applies our action
+            return game.get_last_reward()
+        return game.make_action(action, tics)
 
     def take_action(
         self,
         actions: dict[str, float] | None = None,
         tics: int = 1,
+        include_sectors: bool = False,
+        include_depth: bool = True,
     ) -> dict:
         """Execute an action and return the full resulting state.
 
@@ -407,11 +551,10 @@ class GameManager:
         """
         game = self._require_episode()
 
-        action_list = [0.0] * len(self._buttons)
-
+        # Validate button names for the public API
         if actions:
             button_index = {b.name: i for i, b in enumerate(self._buttons)}
-            for name, value in actions.items():
+            for name in actions:
                 upper = name.upper()
                 if upper not in BUTTON_NAMES:
                     raise ToolError(
@@ -423,33 +566,38 @@ class GameManager:
                         f"Button {name!r} is not configured. "
                         f"Configured: {sorted(button_index.keys())}"
                     )
-                action_list[button_index[upper]] = float(value)
 
-        reward = game.make_action(action_list, tics)
+        action_list = self._build_action_list(actions)
 
-        if game.is_episode_finished():
-            return self._finished_state(game, reward=reward)
+        with self._game_lock:
+            reward = self._make_action(game, action_list, tics)
+            self._clear_action(game)
 
-        result = self._extract_full_state(game)
-        result["reward"] = reward
-        return result
+            if game.is_episode_finished():
+                return self._finished_state(game, reward=reward)
+
+            result = self._extract_full_state(game, include_sectors=include_sectors, include_depth=include_depth)
+            result["reward"] = reward
+            return result
 
     def get_objects(self) -> dict:
         """Get object and label info from the current state."""
         game = self._require_episode()
-        state = game.get_state()
-        px, py, pa = self._get_player_pos(game)
-        return {
-            "objects": extract_objects(state, player_x=px, player_y=py, player_angle=pa),
-        }
+        with self._game_lock:
+            state = game.get_state()
+            px, py, pa = self._get_player_pos(game)
+            return {
+                "objects": extract_objects(state, player_x=px, player_y=py, player_angle=pa),
+            }
 
     def get_map(self) -> bytes | None:
         """Get the automap buffer as PNG bytes."""
         game = self._require_episode()
-        state = game.get_state()
-        if state.automap_buffer is not None:
-            return screen_buffer_to_png(state.automap_buffer)
-        return None
+        with self._game_lock:
+            state = game.get_state()
+            if state.automap_buffer is not None:
+                return screen_buffer_to_png(state.automap_buffer)
+            return None
 
     def get_available_actions(self) -> dict:
         """Return the configured buttons with usage info."""
@@ -482,3 +630,829 @@ class GameManager:
                 "MOVE_LEFT_RIGHT_DELTA": "positive=right, negative=left (speed units)",
             },
         }
+
+    # ------------------------------------------------------------------
+    # Compound action helpers
+    # ------------------------------------------------------------------
+
+    def _find_object_by_id(self, game: vzd.DoomGame, object_id: int) -> dict | None:
+        """Find a specific object by numeric ID in the current state."""
+        state = game.get_state()
+        if state is None:
+            return None
+        px, py, pa = self._get_player_pos(game)
+        for obj in extract_objects(state, player_x=px, player_y=py, player_angle=pa):
+            if obj["id"] == object_id:
+                return obj
+        return None
+
+    def _is_dead(self, game: vzd.DoomGame) -> bool:
+        return bool(game.get_game_variable(vzd.GameVariable.DEAD))
+
+    def _clear_action(self, game: vzd.DoomGame) -> None:
+        """Set a no-op action so the render thread doesn't repeat the last action."""
+        if self._async and not game.is_episode_finished():
+            game.set_action(self._build_action_list())
+
+    def _compound_result(
+        self, game: vzd.DoomGame, summary: dict, stop_reason: str,
+    ) -> dict:
+        """Build a compound action result with state + summary."""
+        summary["stop_reason"] = stop_reason
+        self._clear_action(game)
+
+        if game.is_episode_finished():
+            result = self._finished_state(game)
+            result["action_summary"] = summary
+            return result
+
+        result = self._extract_full_state(game, include_depth=True)
+        result["action_summary"] = summary
+        return result
+
+    def _get_position(self, game: vzd.DoomGame) -> tuple[float, float]:
+        x = game.get_game_variable(vzd.GameVariable.POSITION_X)
+        y = game.get_game_variable(vzd.GameVariable.POSITION_Y)
+        return x, y
+
+    def _position_spread(self, history: list[tuple[float, float]]) -> float:
+        """Compute bounding-box diagonal of position history (stuck detection)."""
+        if len(history) < 2:
+            return float("inf")
+        xs = [p[0] for p in history]
+        ys = [p[1] for p in history]
+        return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+    # ------------------------------------------------------------------
+    # Compound actions
+    # ------------------------------------------------------------------
+
+    def aim_and_shoot(
+        self,
+        object_id: int,
+        shots: int = 3,
+        max_tics: int = 100,
+    ) -> dict:
+        """Aim at an object and fire multiple shots. Runs a tight game loop internally.
+
+        Args:
+            object_id: Numeric ID of the target object (from objects list).
+            shots: Number of shots to fire (default 3).
+            max_tics: Maximum tics before giving up (default 100).
+
+        Returns:
+            Game state + action_summary with: shots_fired, hits_landed, kills,
+            ammo_spent, target_name, stop_reason.
+        """
+        game = self._require_episode()
+
+        summary = {
+            "shots_fired": 0,
+            "hits_landed": 0,
+            "kills": 0,
+            "ammo_spent": 0,
+            "target_name": None,
+        }
+        tics_used = 0
+
+        with self._game_lock:
+            initial_killcount = game.get_game_variable(vzd.GameVariable.KILLCOUNT)
+            initial_hitcount = game.get_game_variable(vzd.GameVariable.HITCOUNT)
+            initial_ammo = game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+
+            # Find initial target to get its name
+            target = self._find_object_by_id(game, object_id)
+            if target is not None:
+                summary["target_name"] = target["name"]
+
+            while tics_used < max_tics and summary["shots_fired"] < shots:
+                if game.is_episode_finished() or self._is_dead(game):
+                    summary["kills"] = int(game.get_game_variable(vzd.GameVariable.KILLCOUNT) - initial_killcount)
+                    summary["hits_landed"] = int(game.get_game_variable(vzd.GameVariable.HITCOUNT) - initial_hitcount)
+                    summary["ammo_spent"] = int(initial_ammo - game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO))
+                    reason = "player_died" if self._is_dead(game) else "episode_finished"
+                    return self._compound_result(game, summary, reason)
+
+                # Find target
+                target = self._find_object_by_id(game, object_id)
+                if target is None:
+                    # Target gone - check if we killed it
+                    kills = int(game.get_game_variable(vzd.GameVariable.KILLCOUNT) - initial_killcount)
+                    summary["kills"] = kills
+                    summary["hits_landed"] = int(game.get_game_variable(vzd.GameVariable.HITCOUNT) - initial_hitcount)
+                    summary["ammo_spent"] = int(initial_ammo - game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO))
+                    reason = "target_killed" if kills > 0 else "target_lost"
+                    return self._compound_result(game, summary, reason)
+
+                angle = target["angle_to_aim"]
+
+                # Check ammo
+                current_ammo = game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+                if current_ammo <= 0:
+                    summary["kills"] = int(game.get_game_variable(vzd.GameVariable.KILLCOUNT) - initial_killcount)
+                    summary["hits_landed"] = int(game.get_game_variable(vzd.GameVariable.HITCOUNT) - initial_hitcount)
+                    summary["ammo_spent"] = int(initial_ammo - current_ammo)
+                    return self._compound_result(game, summary, "out_of_ammo")
+
+                # Clamp turn to avoid overshooting
+                clamped = max(-45.0, min(45.0, angle))
+
+                if abs(angle) > _AIM_TOLERANCE:
+                    # Turn to face target
+                    action = self._build_action_list({"TURN_LEFT_RIGHT_DELTA": clamped})
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+                elif not game.get_game_variable(vzd.GameVariable.ATTACK_READY):
+                    # Wait for weapon to be ready
+                    self._make_action(game, self._build_action_list(), 1)
+                    tics_used += 1
+                else:
+                    # Fire! Include small re-aim
+                    action = self._build_action_list({
+                        "ATTACK": 1,
+                        "TURN_LEFT_RIGHT_DELTA": angle,
+                    })
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+                    summary["shots_fired"] += 1
+
+                    # Wait for weapon cooldown (up to 4 tics)
+                    for _ in range(4):
+                        if game.is_episode_finished():
+                            break
+                        if game.get_game_variable(vzd.GameVariable.ATTACK_READY):
+                            break
+                        self._make_action(game, self._build_action_list(), 1)
+                        tics_used += 1
+
+            summary["kills"] = int(game.get_game_variable(vzd.GameVariable.KILLCOUNT) - initial_killcount)
+            summary["hits_landed"] = int(game.get_game_variable(vzd.GameVariable.HITCOUNT) - initial_hitcount)
+            summary["ammo_spent"] = int(initial_ammo - game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO))
+
+            reason = "shots_complete" if summary["shots_fired"] >= shots else "max_tics"
+            return self._compound_result(game, summary, reason)
+
+    def move_to(
+        self,
+        object_id: int,
+        max_tics: int = 140,
+        use: bool = False,
+        stop_on_enemy: bool = True,
+    ) -> dict:
+        """Move toward an object by ID. Runs a tight game loop internally.
+
+        Args:
+            object_id: Numeric ID of the target object.
+            max_tics: Maximum tics before giving up (default 140).
+            use: Press USE when arriving (for switches/doors). Default false.
+            stop_on_enemy: Stop if a monster is spotted nearby. Default true.
+
+        Returns:
+            Game state + action_summary with: distance_moved, distance_remaining,
+            target_name, used_object, threat_object, stop_reason.
+        """
+        game = self._require_episode()
+
+        summary = {
+            "distance_moved": 0.0,
+            "distance_remaining": None,
+            "target_name": None,
+            "used_object": False,
+            "threat_object": None,
+        }
+
+        with self._game_lock:
+            start_x, start_y = self._get_position(game)
+            position_history: list[tuple[float, float]] = []
+            stuck_recoveries = 0
+            tics_used = 0
+
+            # Get initial target info
+            target = self._find_object_by_id(game, object_id)
+            if target is not None:
+                summary["target_name"] = target["name"]
+
+            while tics_used < max_tics:
+                if game.is_episode_finished() or self._is_dead(game):
+                    cx, cy = self._get_position(game)
+                    summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                    reason = "player_died" if self._is_dead(game) else "episode_finished"
+                    return self._compound_result(game, summary, reason)
+
+                # Track position for stuck detection + nav memory
+                pos = self._get_position(game)
+                position_history.append(pos)
+                if len(position_history) > _STUCK_WINDOW:
+                    position_history.pop(0)
+                pa = game.get_game_variable(vzd.GameVariable.ANGLE)
+                self._nav_memory.update(pos[0], pos[1], pa)
+
+                # Find target
+                target = self._find_object_by_id(game, object_id)
+                if target is None:
+                    cx, cy = self._get_position(game)
+                    summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                    return self._compound_result(game, summary, "target_lost")
+
+                distance = target["distance"]
+                angle = target["angle_to_aim"]
+                summary["distance_remaining"] = round(distance, 1)
+
+                # Arrived?
+                if distance < _ARRIVE_DISTANCE:
+                    cx, cy = self._get_position(game)
+                    summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                    if use:
+                        action = self._build_action_list({"USE": 1})
+                        self._make_action(game, action, 1)
+                        tics_used += 1
+                        summary["used_object"] = True
+                    return self._compound_result(game, summary, "arrived")
+
+                # Enemy scan
+                if stop_on_enemy:
+                    state = game.get_state()
+                    if state is not None:
+                        px, py, pa = self._get_player_pos(game)
+                        all_objs = extract_objects(state, player_x=px, player_y=py, player_angle=pa)
+
+                        for obj in all_objs:
+                            if obj["id"] == object_id:
+                                continue
+                            info = get_object_info(obj["name"])
+                            if info["type"] == "monster" and obj["distance"] < _ENEMY_ALERT_DIST and obj["is_visible"]:
+                                cx, cy = self._get_position(game)
+                                summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                                summary["threat_object"] = {
+                                    "id": obj["id"],
+                                    "name": obj["name"],
+                                    "distance": obj["distance"],
+                                    "angle_to_aim": obj["angle_to_aim"],
+                                }
+                                return self._compound_result(game, summary, "enemy_nearby")
+
+                # Stuck detection
+                if len(position_history) >= _STUCK_WINDOW:
+                    spread = self._position_spread(position_history)
+                    if spread < _STUCK_THRESHOLD:
+                        stuck_recoveries += 1
+                        if stuck_recoveries > 3:
+                            cx, cy = self._get_position(game)
+                            summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                            return self._compound_result(game, summary, "stuck")
+                        # Strafe + turn recovery - alternate directions
+                        strafe_dir = 20.0 if stuck_recoveries % 2 == 1 else -20.0
+                        turn_amount = 25.0 if stuck_recoveries % 2 == 1 else -25.0
+                        for _ in range(3):
+                            if game.is_episode_finished():
+                                break
+                            action = self._build_action_list({
+                                "MOVE_LEFT_RIGHT_DELTA": strafe_dir,
+                                "TURN_LEFT_RIGHT_DELTA": turn_amount,
+                            })
+                            self._make_action(game, action, 1)
+                            tics_used += 1
+                        # Push forward after strafe
+                        for _ in range(4):
+                            if game.is_episode_finished():
+                                break
+                            action = self._build_action_list({
+                                "MOVE_FORWARD_BACKWARD_DELTA": 25,
+                            })
+                            self._make_action(game, action, 1)
+                            tics_used += 1
+                        position_history.clear()
+                        continue
+
+                # Movement - clamp turn speed to avoid wild spinning
+                clamped_angle = max(-30.0, min(30.0, angle))
+                if abs(angle) > 15:
+                    # Large angle - turn only (no forward into walls)
+                    action = self._build_action_list({"TURN_LEFT_RIGHT_DELTA": clamped_angle})
+                else:
+                    # Small angle - turn + forward
+                    action = self._build_action_list({
+                        "TURN_LEFT_RIGHT_DELTA": clamped_angle,
+                        "MOVE_FORWARD_BACKWARD_DELTA": 25,
+                    })
+                self._make_action(game, action, 1)
+                tics_used += 1
+
+            cx, cy = self._get_position(game)
+            summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+            return self._compound_result(game, summary, "max_tics")
+
+    def explore(
+        self,
+        max_tics: int = 200,
+        stop_on_enemy: bool = True,
+        stop_on_item: bool = False,
+    ) -> dict:
+        """Explore the environment autonomously. Walks forward, avoids walls, scans for enemies/items.
+
+        Args:
+            max_tics: Maximum tics to explore (default 200).
+            stop_on_enemy: Stop when a visible monster is spotted nearby. Default true.
+            stop_on_item: Stop when a new item/ammo is spotted. Default false.
+
+        Returns:
+            Game state + action_summary with: distance_moved, direction_changes,
+            enemies_seen, items_seen, stop_reason.
+        """
+        game = self._require_episode()
+
+        summary = {
+            "distance_moved": 0.0,
+            "direction_changes": 0,
+            "enemies_seen": [],
+            "items_seen": [],
+        }
+        seen_enemy_ids: set[int] = set()
+        seen_item_ids: set[int] = set()
+
+        with self._game_lock:
+            start_x, start_y = self._get_position(game)
+            position_history: list[tuple[float, float]] = []
+            stuck_recoveries = 0
+            tics_used = 0
+            turn_bias = 0.0
+
+            while tics_used < max_tics:
+                if game.is_episode_finished() or self._is_dead(game):
+                    cx, cy = self._get_position(game)
+                    summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                    reason = "player_died" if self._is_dead(game) else "episode_finished"
+                    return self._compound_result(game, summary, reason)
+
+                # Track position for stuck detection + nav memory
+                pos = self._get_position(game)
+                position_history.append(pos)
+                if len(position_history) > _STUCK_WINDOW:
+                    position_history.pop(0)
+                pa = game.get_game_variable(vzd.GameVariable.ANGLE)
+                self._nav_memory.update(pos[0], pos[1], pa)
+
+                state = game.get_state()
+                if state is None:
+                    cx, cy = self._get_position(game)
+                    summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                    return self._compound_result(game, summary, "episode_finished")
+
+                # Object scanning
+                px, py, pa = self._get_player_pos(game)
+                all_objs = extract_objects(state, player_x=px, player_y=py, player_angle=pa)
+                from .objects import get_object_info
+
+                for obj in all_objs:
+                    info = get_object_info(obj["name"])
+                    if info["type"] == "monster" and obj["is_visible"] and obj["distance"] < _ENEMY_ALERT_DIST:
+                        if obj["id"] not in seen_enemy_ids:
+                            seen_enemy_ids.add(obj["id"])
+                            enemy_info = {
+                                "id": obj["id"],
+                                "name": obj["name"],
+                                "distance": obj["distance"],
+                                "angle_to_aim": obj["angle_to_aim"],
+                            }
+                            summary["enemies_seen"].append(enemy_info)
+                            if stop_on_enemy:
+                                cx, cy = self._get_position(game)
+                                summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                                return self._compound_result(game, summary, "enemy_spotted")
+
+                    if info["type"] in _ITEM_TYPES and obj["is_visible"]:
+                        if obj["id"] not in seen_item_ids:
+                            seen_item_ids.add(obj["id"])
+                            item_info = {
+                                "id": obj["id"],
+                                "name": obj["name"],
+                                "distance": obj["distance"],
+                            }
+                            summary["items_seen"].append(item_info)
+                            if stop_on_item:
+                                cx, cy = self._get_position(game)
+                                summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                                return self._compound_result(game, summary, "item_found")
+
+                # Stuck detection
+                if len(position_history) >= _STUCK_WINDOW:
+                    spread = self._position_spread(position_history)
+                    if spread < _STUCK_THRESHOLD:
+                        stuck_recoveries += 1
+                        if stuck_recoveries > 3:
+                            cx, cy = self._get_position(game)
+                            summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                            return self._compound_result(game, summary, "stuck")
+                        # Recovery: turn ~90 degrees then push forward
+                        turn_dir = 30.0 if stuck_recoveries % 2 == 1 else -30.0
+                        for _ in range(3):
+                            if game.is_episode_finished():
+                                break
+                            action = self._build_action_list({"TURN_LEFT_RIGHT_DELTA": turn_dir})
+                            self._make_action(game, action, 1)
+                            tics_used += 1
+                        # Push forward after turning
+                        for _ in range(5):
+                            if game.is_episode_finished():
+                                break
+                            action = self._build_action_list({"MOVE_FORWARD_BACKWARD_DELTA": 25})
+                            self._make_action(game, action, 1)
+                            tics_used += 1
+                        summary["direction_changes"] += 1
+                        turn_bias = 0.0
+                        position_history.clear()
+                        continue
+
+                # Depth-based navigation with hysteresis to prevent oscillation
+                depth = state.depth_buffer
+                actions: dict[str, float] = {}
+
+                if depth is not None:
+                    h, w = depth.shape
+                    band_h = max(h // 6, 1)
+                    mid = h // 2
+                    band = depth[mid - band_h:mid + band_h, :]
+                    third = w // 3
+                    left_score = float(band[:, :third].mean())
+                    center_score = float(band[:, third:2*third].mean())
+                    right_score = float(band[:, 2*third:].mean())
+
+                    if center_score < _WALL_CLOSE:
+                        # Imminent wall - commit to a turn direction
+                        # Only switch direction if the difference is significant
+                        # (hysteresis prevents oscillation in corridors)
+                        if abs(left_score - right_score) > 3:
+                            turn_bias = -25.0 if left_score > right_score else 25.0
+                        elif turn_bias == 0.0:
+                            # No previous bias - pick the more open side
+                            turn_bias = -25.0 if left_score >= right_score else 25.0
+                        # else: keep previous turn_bias direction
+                        actions["TURN_LEFT_RIGHT_DELTA"] = turn_bias
+                        summary["direction_changes"] += 1
+                    elif center_score < _WALL_NEAR:
+                        # Wall approaching - gentle turn + keep moving
+                        if abs(left_score - right_score) > 3:
+                            turn_bias = -10.0 if left_score > right_score else 10.0
+                        elif turn_bias == 0.0:
+                            turn_bias = -10.0 if left_score >= right_score else 10.0
+                        # else: keep previous turn_bias direction
+                        actions["TURN_LEFT_RIGHT_DELTA"] = turn_bias
+                        actions["MOVE_FORWARD_BACKWARD_DELTA"] = 15
+                    else:
+                        # Open space - go forward, decay turn bias
+                        turn_bias *= 0.5  # smoothly return to straight
+                        if abs(turn_bias) < 1.0:
+                            turn_bias = 0.0
+                        actions["TURN_LEFT_RIGHT_DELTA"] = turn_bias
+                        actions["MOVE_FORWARD_BACKWARD_DELTA"] = 25
+                else:
+                    # No depth buffer - just walk forward
+                    actions["MOVE_FORWARD_BACKWARD_DELTA"] = 25
+
+                action_list = self._build_action_list(actions)
+                self._make_action(game, action_list, 1)
+                tics_used += 1
+
+            cx, cy = self._get_position(game)
+            summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+            return self._compound_result(game, summary, "max_tics")
+
+    def retreat(self, tics: int = 35, backpedal: bool = False) -> dict:
+        """Turn and run or backpedal away from current facing direction.
+
+        Args:
+            tics: Total game tics for the retreat (default 35).
+            backpedal: If True, move backward while keeping current facing.
+                If False (default), turn 180 degrees then sprint forward.
+
+        Returns:
+            Game state + action_summary with: distance_moved, mode, stop_reason.
+        """
+        game = self._require_episode()
+
+        mode = "backpedal" if backpedal else "turn_and_run"
+        summary = {"distance_moved": 0.0, "mode": mode}
+
+        with self._game_lock:
+            start_x, start_y = self._get_position(game)
+            tics_used = 0
+
+            if backpedal:
+                while tics_used < tics:
+                    if game.is_episode_finished() or self._is_dead(game):
+                        cx, cy = self._get_position(game)
+                        summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                        reason = "player_died" if self._is_dead(game) else "episode_finished"
+                        return self._compound_result(game, summary, reason)
+                    action = self._build_action_list({
+                        "MOVE_FORWARD_BACKWARD_DELTA": -25,
+                        "SPEED": 1,
+                    })
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+                    pos = self._get_position(game)
+                    pa = game.get_game_variable(vzd.GameVariable.ANGLE)
+                    self._nav_memory.update(pos[0], pos[1], pa)
+            else:
+                # Turn 180 degrees (~6 tics at 30 deg/tic)
+                for _ in range(6):
+                    if tics_used >= tics or game.is_episode_finished():
+                        break
+                    action = self._build_action_list({"TURN_LEFT_RIGHT_DELTA": 30})
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+
+                # Sprint forward
+                while tics_used < tics:
+                    if game.is_episode_finished() or self._is_dead(game):
+                        cx, cy = self._get_position(game)
+                        summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+                        reason = "player_died" if self._is_dead(game) else "episode_finished"
+                        return self._compound_result(game, summary, reason)
+                    action = self._build_action_list({
+                        "MOVE_FORWARD_BACKWARD_DELTA": 25,
+                        "SPEED": 1,
+                    })
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+                    pos = self._get_position(game)
+                    pa = game.get_game_variable(vzd.GameVariable.ANGLE)
+                    self._nav_memory.update(pos[0], pos[1], pa)
+
+            cx, cy = self._get_position(game)
+            summary["distance_moved"] = round(math.hypot(cx - start_x, cy - start_y), 1)
+            return self._compound_result(game, summary, "complete")
+
+    def strafe_and_shoot(
+        self,
+        object_id: int,
+        direction: str = "auto",
+        shots: int = 5,
+        max_tics: int = 100,
+    ) -> dict:
+        """Strafe laterally while firing at a target. Useful against hitscan enemies.
+
+        Args:
+            object_id: Numeric ID of the target (from objects list).
+            direction: Strafe direction - "left", "right", or "auto" (alternates).
+            shots: Number of shots to fire (default 5).
+            max_tics: Maximum tics before giving up (default 100).
+
+        Returns:
+            Game state + action_summary with: shots_fired, hits_landed, kills,
+            ammo_spent, target_name, strafe_direction, damage_taken, stop_reason.
+        """
+        game = self._require_episode()
+
+        summary = {
+            "shots_fired": 0,
+            "hits_landed": 0,
+            "kills": 0,
+            "ammo_spent": 0,
+            "target_name": None,
+            "strafe_direction": direction,
+            "damage_taken": 0,
+        }
+        tics_used = 0
+        strafe_sign = -1.0  # start left
+
+        with self._game_lock:
+            initial_killcount = game.get_game_variable(vzd.GameVariable.KILLCOUNT)
+            initial_hitcount = game.get_game_variable(vzd.GameVariable.HITCOUNT)
+            initial_ammo = game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+            initial_damage_taken = game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN)
+
+            target = self._find_object_by_id(game, object_id)
+            if target is not None:
+                summary["target_name"] = target["name"]
+
+            while tics_used < max_tics and summary["shots_fired"] < shots:
+                if game.is_episode_finished() or self._is_dead(game):
+                    self._update_combat_summary(game, summary, initial_killcount, initial_hitcount, initial_ammo)
+                    summary["damage_taken"] = int(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN) - initial_damage_taken)
+                    reason = "player_died" if self._is_dead(game) else "episode_finished"
+                    return self._compound_result(game, summary, reason)
+
+                target = self._find_object_by_id(game, object_id)
+                if target is None:
+                    self._update_combat_summary(game, summary, initial_killcount, initial_hitcount, initial_ammo)
+                    summary["damage_taken"] = int(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN) - initial_damage_taken)
+                    kills = summary["kills"]
+                    reason = "target_killed" if kills > 0 else "target_lost"
+                    return self._compound_result(game, summary, reason)
+
+                angle = target["angle_to_aim"]
+
+                current_ammo = game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+                if current_ammo <= 0:
+                    self._update_combat_summary(game, summary, initial_killcount, initial_hitcount, initial_ammo)
+                    summary["damage_taken"] = int(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN) - initial_damage_taken)
+                    return self._compound_result(game, summary, "out_of_ammo")
+
+                # Auto-alternate strafe direction every ~15 tics
+                if direction == "auto" and tics_used % 15 == 0 and tics_used > 0:
+                    strafe_sign *= -1
+                elif direction == "right":
+                    strafe_sign = 1.0
+                elif direction == "left":
+                    strafe_sign = -1.0
+
+                strafe_delta = strafe_sign * 20.0
+
+                if abs(angle) <= _AIM_TOLERANCE and game.get_game_variable(vzd.GameVariable.ATTACK_READY):
+                    # On target + ready - fire + strafe
+                    action = self._build_action_list({
+                        "TURN_LEFT_RIGHT_DELTA": angle,
+                        "MOVE_LEFT_RIGHT_DELTA": strafe_delta,
+                        "ATTACK": 1,
+                    })
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+                    summary["shots_fired"] += 1
+                elif game.get_game_variable(vzd.GameVariable.ATTACK_READY):
+                    # Large angle but weapon ready - aim + strafe + fire
+                    action = self._build_action_list({
+                        "TURN_LEFT_RIGHT_DELTA": angle,
+                        "MOVE_LEFT_RIGHT_DELTA": strafe_delta,
+                        "ATTACK": 1,
+                    })
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+                    summary["shots_fired"] += 1
+                else:
+                    # Weapon cooldown - strafe + aim only
+                    action = self._build_action_list({
+                        "TURN_LEFT_RIGHT_DELTA": angle,
+                        "MOVE_LEFT_RIGHT_DELTA": strafe_delta,
+                    })
+                    self._make_action(game, action, 1)
+                    tics_used += 1
+
+            self._update_combat_summary(game, summary, initial_killcount, initial_hitcount, initial_ammo)
+            summary["damage_taken"] = int(game.get_game_variable(vzd.GameVariable.DAMAGE_TAKEN) - initial_damage_taken)
+            reason = "shots_complete" if summary["shots_fired"] >= shots else "max_tics"
+            return self._compound_result(game, summary, reason)
+
+    def _update_combat_summary(
+        self, game: vzd.DoomGame, summary: dict,
+        initial_killcount: float, initial_hitcount: float, initial_ammo: float,
+    ) -> None:
+        """Update kills/hits/ammo in a combat summary dict."""
+        summary["kills"] = int(game.get_game_variable(vzd.GameVariable.KILLCOUNT) - initial_killcount)
+        summary["hits_landed"] = int(game.get_game_variable(vzd.GameVariable.HITCOUNT) - initial_hitcount)
+        summary["ammo_spent"] = int(initial_ammo - game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO))
+
+    # ------------------------------------------------------------------
+    # Threat assessment (no tics consumed)
+    # ------------------------------------------------------------------
+
+    _THREAT_WEIGHTS = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    _ATTACK_URGENCY = {"hitscan": 3, "projectile": 2, "melee": 1, "none": 0}
+
+    def get_threat_assessment(self) -> dict:
+        """Analyze all visible threats and return prioritized tactical info.
+
+        No game tics are consumed. Uses current game state only.
+
+        Returns:
+            threat_level, threats (sorted by priority), incoming_projectiles,
+            tactical_advice, player_health, player_armor, selected_weapon_ammo.
+        """
+        game = self._require_episode()
+
+        with self._game_lock:
+            state = game.get_state()
+            if state is None:
+                return {"threat_level": "none", "threats": [], "incoming_projectiles": [],
+                        "tactical_advice": [], "player_health": 0, "player_armor": 0,
+                        "selected_weapon_ammo": 0}
+
+            px, py, pa = self._get_player_pos(game)
+            all_objects = extract_objects(state, player_x=px, player_y=py, player_angle=pa)
+            health = game.get_game_variable(vzd.GameVariable.HEALTH)
+            armor = game.get_game_variable(vzd.GameVariable.ARMOR)
+            ammo = game.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)
+
+        threats = []
+        projectiles = []
+        advice = []
+
+        for obj in all_objects:
+            info = get_object_info(obj["name"])
+
+            if info["type"] == "projectile" and obj["is_visible"]:
+                projectiles.append({
+                    "name": obj["name"],
+                    "distance": round(obj["distance"], 1),
+                    "angle_to_aim": round(obj["angle_to_aim"], 1),
+                })
+                continue
+
+            if info["type"] != "monster":
+                continue
+            if obj["distance"] > _MONSTER_RANGE:
+                continue
+
+            dist = max(obj["distance"], 1.0)
+            threat_w = self._THREAT_WEIGHTS.get(info["threat"], 0)
+            attack_u = self._ATTACK_URGENCY.get(info["attack"], 0)
+            proximity = 1000.0 / dist
+            visibility_bonus = 5.0 if obj["is_visible"] else 0.0
+
+            score = threat_w * 10 + attack_u * 5 + proximity + visibility_bonus
+
+            # Archvile always top priority
+            if obj["name"] == "Archvile":
+                score += 100
+
+            threats.append({
+                "id": obj["id"],
+                "name": obj["name"],
+                "distance": round(dist, 1),
+                "angle_to_aim": round(obj["angle_to_aim"], 1),
+                "attack_type": info["attack"],
+                "threat": info["threat"],
+                "is_visible": obj["is_visible"],
+                "priority_score": round(score, 1),
+            })
+
+        # Sort by priority score descending
+        threats.sort(key=lambda t: t["priority_score"], reverse=True)
+
+        # Assign ranks
+        for i, t in enumerate(threats):
+            t["priority_rank"] = i + 1
+
+        # Overall threat level
+        if not threats:
+            level = "none"
+        else:
+            top_score = threats[0]["priority_score"]
+            if top_score >= 50:
+                level = "critical"
+            elif top_score >= 30:
+                level = "high"
+            elif top_score >= 15:
+                level = "medium"
+            else:
+                level = "low"
+
+        # Tactical advice
+        if threats:
+            top = threats[0]
+            if top["attack_type"] == "hitscan":
+                advice.append(f"PRIORITY: Kill {top['name']} - hitscan (can't dodge)")
+            elif top["name"] == "Archvile":
+                advice.append(f"PRIORITY: Kill {top['name']} - resurrects dead enemies")
+            else:
+                advice.append(f"PRIORITY: {top['name']} at {top['distance']} units")
+
+        if health <= 25:
+            advice.append("CRITICAL: Low health - retreat or find medikit")
+        elif health <= 50:
+            advice.append("Low health - consider retreating")
+
+        if ammo <= 0:
+            advice.append("NO AMMO - switch weapon or retreat")
+
+        if projectiles:
+            advice.append(f"DODGE: {len(projectiles)} incoming projectile(s)")
+
+        hitscan_count = sum(1 for t in threats if t["attack_type"] == "hitscan" and t["is_visible"])
+        if hitscan_count > 1:
+            advice.append(f"WARNING: {hitscan_count} hitscan enemies - use strafe_and_shoot")
+
+        return {
+            "threat_level": level,
+            "threats": threats,
+            "incoming_projectiles": projectiles,
+            "tactical_advice": advice,
+            "player_health": health,
+            "player_armor": armor,
+            "selected_weapon_ammo": ammo,
+        }
+
+    # ------------------------------------------------------------------
+    # Navigation info (no tics consumed)
+    # ------------------------------------------------------------------
+
+    def get_navigation_info(self) -> dict:
+        """Get spatial navigation intelligence from the navigation memory.
+
+        No game tics are consumed. Returns exploration progress, directions,
+        key locations, and nearby doors.
+        """
+        game = self._require_episode()
+
+        with self._game_lock:
+            state = game.get_state()
+            if state is None:
+                return {"cells_explored": 0}
+
+            px, py, pa = self._get_player_pos(game)
+            all_objects = extract_objects(state, player_x=px, player_y=py, player_angle=pa)
+            sectors = extract_sectors(state)
+
+            self._nav_memory.update(px, py, pa, objects=all_objects, sectors=sectors)
+
+        return self._nav_memory.get_exploration_summary(px, py, pa)

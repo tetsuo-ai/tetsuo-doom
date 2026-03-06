@@ -24,7 +24,10 @@ def start_game(
     episode_timeout: int | None = None,
     render_hud: bool = False,
     window_visible: bool = False,
+    async_player: bool = False,
+    ticrate: int | None = None,
     seed: int | None = None,
+    recording_path: str | None = None,
 ) -> dict:
     """Start a new Doom game.
 
@@ -44,7 +47,15 @@ def start_game(
         episode_timeout: Max tics per episode. None uses scenario/map default.
         render_hud: Whether to render the HUD overlay.
         window_visible: Open a game window so you can watch. Requires a display.
+        async_player: Run game in real-time (ASYNC_PLAYER mode). The game window
+            shows smooth continuous gameplay instead of freezing between agent
+            actions. The world keeps running between take_action calls. Use with
+            window_visible=true to watch the agent play.
+        ticrate: Game speed in tics/sec for async mode (default 35 = normal speed).
+            Lower values slow the game down, higher speeds it up.
         seed: Random seed for reproducibility.
+        recording_path: File path to record episode demo (.lmp). The demo file
+            can be replayed in ViZDoom or Doom source ports.
     """
     return manager.start(
         scenario=scenario,
@@ -57,18 +68,23 @@ def start_game(
         episode_timeout=episode_timeout,
         render_hud=render_hud,
         window_visible=window_visible,
+        async_player=async_player,
+        ticrate=ticrate,
         seed=seed,
+        recording_path=recording_path,
     )
 
 
 @mcp.tool
-def get_state() -> list:
+def get_state(
+    include_sectors: bool = False,
+    include_depth: bool = True,
+):
     """Get the current game state: screenshot + full structured data.
 
     Returns a screenshot image and game state dict containing:
     - game_variables: health, armor, position, angle, ammo, weapons, kills, etc.
     - objects: all entities with distance, angle_to_aim, type, threat level, HP
-    - sectors: map geometry (wall lines, floor/ceiling heights)
     - depth: spatial awareness (min/mean distance per screen region)
     - episode_finished, tic, total_reward
 
@@ -78,8 +94,16 @@ def get_state() -> list:
       Pass this value directly to TURN_LEFT_RIGHT_DELTA to aim at the object.
     - type/threat/attack_type/typical_hp/description: from enemy database
     - is_visible: whether currently on screen
+
+    Args:
+        include_sectors: Include map geometry (wall lines, heights). Very large -
+            only request when you need spatial/navigation data. Default false.
+        include_depth: Include depth buffer stats per screen region. Default true.
     """
-    state = manager.get_state()
+    state = manager.get_state(
+        include_sectors=include_sectors,
+        include_depth=include_depth,
+    )
     screenshot_png = state.pop("screenshot_png", None)
 
     if screenshot_png is not None:
@@ -88,7 +112,12 @@ def get_state() -> list:
 
 
 @mcp.tool
-def take_action(actions: dict[str, float] | None = None, tics: int = 1) -> list:
+def take_action(
+    actions: dict[str, float] | None = None,
+    tics: int = 1,
+    include_sectors: bool = False,
+    include_depth: bool = True,
+):
     """Execute an action and return the resulting game state.
 
     Args:
@@ -103,10 +132,16 @@ def take_action(actions: dict[str, float] | None = None, tics: int = 1) -> list:
         tics: Game tics to hold the action (default 1).
             WARNING: delta values are MULTIPLIED by tics.
             Use tics=1 for precise aiming.
+        include_sectors: Include map geometry. Very large - default false.
+        include_depth: Include depth buffer stats. Default true.
 
     Returns screenshot + full state (same format as get_state).
     """
-    result = manager.take_action(actions, tics)
+    result = manager.take_action(
+        actions, tics,
+        include_sectors=include_sectors,
+        include_depth=include_depth,
+    )
     screenshot_png = result.pop("screenshot_png", None)
 
     if screenshot_png is not None:
@@ -129,7 +164,7 @@ def get_objects() -> dict:
 
 
 @mcp.tool
-def get_map() -> list:
+def get_map():
     """Get the automap (top-down view) of the level."""
     map_png = manager.get_map()
     if map_png is not None:
@@ -138,12 +173,16 @@ def get_map() -> list:
 
 
 @mcp.tool
-def new_episode() -> dict:
+def new_episode(recording_path: str | None = None) -> dict:
     """Start a new episode in the current game.
 
     Resets the level while keeping the same configuration.
+
+    Args:
+        recording_path: File path to record this episode's demo (.lmp).
+            If not set, uses the recording_path from start_game (if any).
     """
-    return manager.new_episode()
+    return manager.new_episode(recording_path=recording_path)
 
 
 @mcp.tool
@@ -154,6 +193,194 @@ def get_available_actions() -> dict:
     sign conventions for delta buttons, and a usage example.
     """
     return manager.get_available_actions()
+
+
+@mcp.tool
+def aim_and_shoot(
+    object_id: int,
+    shots: int = 3,
+    max_tics: int = 100,
+):
+    """Aim at an enemy and fire multiple shots. Handles aiming, firing, and weapon cooldown automatically.
+
+    This is a compound action - it runs many game tics internally in milliseconds,
+    so the player doesn't stand idle between LLM decisions.
+
+    Typical workflow: get_state -> find enemy -> aim_and_shoot(enemy_id) -> assess result.
+
+    Args:
+        object_id: Numeric ID of the target (from the objects list in game state).
+        shots: Number of shots to fire (default 3). Stops early if target dies.
+        max_tics: Maximum game tics before giving up (default 100).
+
+    Returns screenshot + state with action_summary containing:
+        shots_fired, hits_landed, kills, ammo_spent, target_name, stop_reason.
+    Stop reasons: shots_complete, target_killed, target_lost, player_died,
+        out_of_ammo, episode_finished, max_tics.
+    """
+    result = manager.aim_and_shoot(object_id, shots=shots, max_tics=max_tics)
+    screenshot_png = result.pop("screenshot_png", None)
+    if screenshot_png is not None:
+        return [Image(data=screenshot_png, format="png"), result]
+    return [result]
+
+
+@mcp.tool
+def move_to(
+    object_id: int,
+    max_tics: int = 140,
+    use: bool = False,
+    stop_on_enemy: bool = True,
+):
+    """Move toward an object by ID. Handles pathfinding, turning, and stuck recovery automatically.
+
+    This is a compound action - it runs many game tics internally in milliseconds.
+
+    Typical workflow: get_state -> find object -> move_to(object_id) -> assess result.
+
+    Args:
+        object_id: Numeric ID of the target (from the objects list in game state).
+        max_tics: Maximum game tics before giving up (default 140).
+        use: Press USE when arriving (for switches/doors). Default false.
+        stop_on_enemy: Stop if a visible monster appears nearby. Default true.
+
+    Returns screenshot + state with action_summary containing:
+        distance_moved, distance_remaining, target_name, used_object,
+        threat_object, stop_reason.
+    Stop reasons: arrived, target_lost, enemy_nearby, stuck, player_died,
+        episode_finished, max_tics.
+    """
+    result = manager.move_to(
+        object_id, max_tics=max_tics, use=use, stop_on_enemy=stop_on_enemy,
+    )
+    screenshot_png = result.pop("screenshot_png", None)
+    if screenshot_png is not None:
+        return [Image(data=screenshot_png, format="png"), result]
+    return [result]
+
+
+@mcp.tool
+def explore(
+    max_tics: int = 200,
+    stop_on_enemy: bool = True,
+    stop_on_item: bool = False,
+):
+    """Explore the environment autonomously. Walks forward, avoids walls, scans for threats and items.
+
+    This is a compound action - it runs many game tics internally in milliseconds.
+    Uses depth buffer for wall avoidance and stuck detection for recovery.
+
+    Typical gameplay loop: explore -> enemy_spotted -> aim_and_shoot -> explore -> item_found -> move_to.
+
+    Args:
+        max_tics: Maximum game tics to explore (default 200).
+        stop_on_enemy: Stop when a visible monster is spotted nearby. Default true.
+        stop_on_item: Stop when a new item/ammo is spotted. Default false.
+
+    Returns screenshot + state with action_summary containing:
+        distance_moved, direction_changes, enemies_seen[], items_seen[], stop_reason.
+    Stop reasons: enemy_spotted, item_found, stuck, player_died,
+        episode_finished, max_tics.
+    """
+    result = manager.explore(
+        max_tics=max_tics, stop_on_enemy=stop_on_enemy, stop_on_item=stop_on_item,
+    )
+    screenshot_png = result.pop("screenshot_png", None)
+    if screenshot_png is not None:
+        return [Image(data=screenshot_png, format="png"), result]
+    return [result]
+
+
+@mcp.tool
+def strafe_and_shoot(
+    object_id: int,
+    direction: str = "auto",
+    shots: int = 5,
+    max_tics: int = 100,
+):
+    """Strafe laterally while firing at an enemy. Better than aim_and_shoot against hitscan enemies.
+
+    This is a compound action - it runs many game tics internally in milliseconds.
+    The player dodges left/right while keeping the target in the crosshair and firing.
+
+    Args:
+        object_id: Numeric ID of the target (from the objects list in game state).
+        direction: Strafe direction - "left", "right", or "auto" (alternates every ~15 tics).
+        shots: Number of shots to fire (default 5).
+        max_tics: Maximum game tics before giving up (default 100).
+
+    Returns screenshot + state with action_summary containing:
+        shots_fired, hits_landed, kills, ammo_spent, target_name, strafe_direction,
+        damage_taken, stop_reason.
+    """
+    result = manager.strafe_and_shoot(
+        object_id, direction=direction, shots=shots, max_tics=max_tics,
+    )
+    screenshot_png = result.pop("screenshot_png", None)
+    if screenshot_png is not None:
+        return [Image(data=screenshot_png, format="png"), result]
+    return [result]
+
+
+@mcp.tool
+def retreat(
+    tics: int = 35,
+    backpedal: bool = False,
+):
+    """Retreat from the current position. Turn and run or backpedal.
+
+    This is a compound action - it runs many game tics internally in milliseconds.
+
+    Args:
+        tics: Total game tics for the retreat (default 35, ~1 second).
+        backpedal: If true, move backward while keeping current facing direction
+            (slower but maintains line of sight). If false (default), turn 180
+            degrees then sprint forward (faster escape).
+
+    Returns screenshot + state with action_summary containing:
+        distance_moved, mode ("backpedal" or "turn_and_run"), stop_reason.
+    """
+    result = manager.retreat(tics=tics, backpedal=backpedal)
+    screenshot_png = result.pop("screenshot_png", None)
+    if screenshot_png is not None:
+        return [Image(data=screenshot_png, format="png"), result]
+    return [result]
+
+
+@mcp.tool
+def get_threat_assessment() -> dict:
+    """Analyze all visible threats and return prioritized tactical intelligence.
+
+    No game tics are consumed. Call freely between actions to assess the situation.
+
+    Returns:
+        threat_level: Overall threat - "none", "low", "medium", "high", or "critical".
+        threats: Sorted list of enemies with id, name, distance, angle_to_aim,
+            attack_type, priority_rank, priority_score.
+        incoming_projectiles: Active projectiles to dodge.
+        tactical_advice: String list with prioritized recommendations.
+        player_health, player_armor, selected_weapon_ammo.
+    """
+    return manager.get_threat_assessment()
+
+
+@mcp.tool
+def get_navigation_info() -> dict:
+    """Get spatial navigation intelligence. Tracks exploration across calls.
+
+    No game tics are consumed. Call to check exploration progress, find unexplored
+    areas, locate keys, and detect nearby doors.
+
+    Returns:
+        cells_explored: Number of 128-unit grid cells visited.
+        explored_directions / unexplored_directions: Cardinal directions from current cell.
+        suggested_direction: Best unexplored direction aligned with player facing.
+        keys_found: Keys picked up this episode.
+        known_key_locations: Visible keys not yet picked up.
+        nearby_doors: Detected doors within 512 units.
+        total_doors_found: All doors detected this episode.
+    """
+    return manager.get_navigation_info()
 
 
 @mcp.tool
