@@ -1,10 +1,8 @@
 # doom-mcp
 
-An MCP server that lets AI agents play Doom. Exposes game control, state observation, and action execution as [Model Context Protocol](https://modelcontextprotocol.io) tools.
+<img width="1184" height="880" alt="image" src="https://github.com/user-attachments/assets/0ac87a79-6a2a-41e8-8233-e6ae9a7a7d53" />
 
-Works best with xAI's Grok models. [xAI Grok](https://console.x.ai)
-
-Comes pre-installed with AgenC. [AgenC](https://github.com/tetsuo-ai/AgenC)
+An MCP server that lets AI agents play Doom. Exposes game control, state observation, and action execution as [Model Context Protocol](https://modelcontextprotocol.io) tools. Works best with [xAI Grok](https://console.x.ai) models and comes pre-installed with [AgenC](https://github.com/tetsuo-ai/AgenC).
 
 Agents receive structured game state (objects, depth, sectors, variables) plus screenshots, then send named actions back - no raw button arrays or pixel parsing required.
 
