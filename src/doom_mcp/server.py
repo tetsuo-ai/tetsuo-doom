@@ -384,6 +384,128 @@ def get_navigation_info() -> dict:
 
 
 @mcp.tool
+def get_situation_report():
+    """Get a situation report for directing the autonomous executor.
+
+    Use this instead of get_state when the executor is running (async_player=True).
+    Returns screenshot + compact summary of executor state, recent events,
+    game variables, nearby objects, and exploration progress.
+
+    The executor plays autonomously at 35 Hz. Use this tool every few seconds
+    to monitor progress and decide whether to change objectives or strategy.
+
+    Returns screenshot + dict with:
+        executor_state: Current state (idle/exploring/fighting/collecting/retreating/moving_to).
+        objectives: Current objective queue.
+        strategy: Current strategy parameters.
+        events: Recent events since last call (kills, damage, state changes, etc).
+        game_variables: Health, ammo, position, etc.
+        objects: Nearby filtered objects.
+        exploration: Cells explored, directions, keys, doors.
+    """
+    result = manager.get_situation_report()
+    screenshot_png = result.pop("screenshot_png", None)
+    if screenshot_png is not None:
+        return [Image(data=screenshot_png, format="png"), result]
+    return [result]
+
+
+@mcp.tool
+def set_objective(
+    objective_type: str,
+    params: dict | None = None,
+    priority: int = 0,
+    timeout_tics: int = 0,
+) -> dict:
+    """Set an objective for the autonomous executor.
+
+    The executor will work toward this objective while handling combat and
+    navigation autonomously. Higher priority objectives are executed first.
+    Multiple objectives can be queued.
+
+    Requires async_player=True (game started with autonomous executor).
+
+    Args:
+        objective_type: What to do. One of:
+            - "explore": Explore the map autonomously.
+            - "kill": Kill a specific enemy (params: {"object_id": int}).
+            - "move_to_pos": Move to coordinates (params: {"x": float, "y": float}).
+            - "move_to_obj": Move to an object (params: {"object_id": int}).
+            - "collect": Collect nearby items.
+            - "use_object": Move to and use an object (params: {"object_id": int}).
+            - "retreat": Fall back from current position.
+            - "hold_position": Stay in place, fight if attacked.
+        params: Parameters for the objective.
+        priority: Higher = executed first. Default 0.
+        timeout_tics: Auto-fail after this many tics. 0 = no timeout.
+
+    Returns the updated objective queue.
+    """
+    return manager.set_objective(
+        objective_type=objective_type,
+        params=params,
+        priority=priority,
+        timeout_tics=timeout_tics,
+    )
+
+
+@mcp.tool
+def set_strategy(
+    aggression: float | None = None,
+    health_retreat_threshold: int | None = None,
+    health_collect_threshold: int | None = None,
+    ammo_switch_threshold: int | None = None,
+    engage_range: float | None = None,
+    collect_range: float | None = None,
+    prefer_cover: bool | None = None,
+) -> dict:
+    """Tune the autonomous executor's behavior.
+
+    Requires async_player=True (game started with autonomous executor).
+
+    Args:
+        aggression: 0.0=passive (avoid fights), 1.0=aggressive (engage everything).
+            Default 0.5. At low values, executor retreats from distant enemies.
+        health_retreat_threshold: HP at which executor always retreats. Default 20.
+        health_collect_threshold: HP at which executor seeks health items. Default 50.
+        ammo_switch_threshold: Ammo count at which executor switches weapons. Default 5.
+        engage_range: Max distance (map units) to engage enemies. Default 1500.
+        collect_range: Max distance to collect items. Default 800.
+        prefer_cover: Try to use cover during combat. Default false.
+
+    Returns the updated strategy.
+    """
+    kwargs = {}
+    if aggression is not None:
+        kwargs["aggression"] = aggression
+    if health_retreat_threshold is not None:
+        kwargs["health_retreat_threshold"] = health_retreat_threshold
+    if health_collect_threshold is not None:
+        kwargs["health_collect_threshold"] = health_collect_threshold
+    if ammo_switch_threshold is not None:
+        kwargs["ammo_switch_threshold"] = ammo_switch_threshold
+    if engage_range is not None:
+        kwargs["engage_range"] = engage_range
+    if collect_range is not None:
+        kwargs["collect_range"] = collect_range
+    if prefer_cover is not None:
+        kwargs["prefer_cover"] = prefer_cover
+    return manager.set_strategy(**kwargs)
+
+
+@mcp.tool
+def get_map_knowledge() -> dict:
+    """Get accumulated map knowledge for strategic planning.
+
+    Returns exploration data including position, cells explored, unexplored
+    directions, known keys, doors, and current executor state/objectives.
+
+    No game tics are consumed. Use for planning which areas to explore next.
+    """
+    return manager.get_map_knowledge()
+
+
+@mcp.tool
 def stop_game() -> dict:
     """Stop the current game and release resources."""
     return manager.stop()
